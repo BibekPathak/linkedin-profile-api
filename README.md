@@ -4,6 +4,12 @@ A hosted HTTPS API that accepts a LinkedIn profile URL and returns the profile's
 information as structured JSON: name, headline, location, about, experience,
 education, skills, certifications, languages, and profile images.
 
+Built around an **adaptive extraction engine**: every field is produced by an
+ordered chain of extractors with automatic fallback, field-level provenance and
+confidence (`?debug=true`), a profile **diff/snapshot** API, and service
+**metrics** — so if LinkedIn changes one page, the whole API degrades gracefully
+instead of breaking.
+
 Built for an engineering hiring challenge by reverse-engineering LinkedIn's
 web platform. **For evaluation / educational use only** — scraping LinkedIn is
 subject to their Terms of Service; rate-limit and use sparingly.
@@ -78,13 +84,141 @@ Response (`200`):
 
 Responses are cached in-memory for 15 minutes to reduce load.
 
+### `POST /api/v1/profile?debug=true`
+
+Returns the same profile plus an `metadata` object giving full visibility into
+how each field was extracted:
+
+```json
+{
+  "profile": { ...same as above... },
+  "metadata": {
+    "sources": {
+      "experience": { "source": "details_page", "confidence": 0.96, "status": "success", "duration_ms": 2 },
+      "skills":     { "source": "details_page", "confidence": 0.9,  "status": "success", "duration_ms": 1 }
+    },
+    "timings_ms": { "experience": 2, "total": 22875 },
+    "pages_visited": 6,
+    "warnings": [ { "section": "experience", "reason": "section_not_found", "fallback_attempted": true } ],
+    "schema_health": { "experience": "healthy", "education": "healthy", "skills": "healthy" }
+  }
+}
+```
+
+- `sources.<field>.source`: `main_profile` | `details_page` | `flight_data` | `missing`
+- `schema_health`: `healthy` when data was found (or legitimately absent),
+  `degraded` when a section was expected but returned nothing and fell back.
+- `warnings` reports any fallback that was triggered — the first sign of a
+  LinkedIn UI change.
+
+### `POST /api/v1/profile/diff`
+
+Compare a fresh scrape against a previous profile snapshot:
+
+```json
+{
+  "url": "https://www.linkedin.com/in/abhishekpathak0907/",
+  "previous": { "headline": "...", "skills": [ {"name": "PHP"} ], ... }
+}
+```
+
+```json
+{
+  "url": "...",
+  "changed": true,
+  "changes": {
+    "headline": { "before": "Software Engineer at X", "after": "Senior Software Engineer at Y" },
+    "skills":   { "added": [ {"name": "Rust"} ], "removed": [ {"name": "PHP"} ] },
+    "experience": { "added": [...], "removed": [...], "modified": [ {"before": {...}, "after": {...}} ] }
+  }
+}
+```
+
+List items are matched on a stable identity key (`title|company` for
+experience, `school` for education, `name` for skills/certs/languages), so
+reordering doesn't produce false add/remove noise.
+
+### `POST /api/v1/profile/snapshot` · `GET /api/v1/profile/changes`
+
+```bash
+curl -X POST http://localhost:8000/api/v1/profile/snapshot \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://www.linkedin.com/in/abhishekpathak0907/"}'
+# → {"url": "...", "vanity_name": "abhishekpathak0907", "saved": true}
+
+curl "http://localhost:8000/api/v1/profile/changes?url=https://www.linkedin.com/in/abhishekpathak0907/"
+# → {"url": "...", "vanity_name": "...", "has_previous": true, "changes": {...}}
+```
+
+`snapshot` stores the latest profile per vanity name in memory; `changes`
+scrapes it again and diffs against the stored snapshot. The store is
+**in-memory** (resets on restart — a documented limitation of free hosting).
+
+### `GET /metrics`
+
+```json
+{
+  "uptime_seconds": 70,
+  "profiles_scraped": 1,
+  "success": 1,
+  "partial": 0,
+  "failed": 0,
+  "success_rate": 100.0,
+  "avg_scrape_ms": 22875,
+  "cache_hit_rate": 0.0,
+  "field_extraction_success_rate": { "experience": 100.0, "education": 100.0 }
+}
+```
+
 ### `GET /health`
 
 Liveness probe used by the host.
 
 ---
 
-## Approach (reverse-engineering notes)
+## Architecture
+
+```
+                    ┌─ MainProfileExtractor (name, headline, location, about, urn, images)
+                    ├─ ExperienceDetailsExtractor     ┐
+Profile URL ──page──┼─ EducationDetailsExtractor      │ primary (/details/* pages)
+                    ├─ SkillsDetailsExtractor         │
+                    ├─ CertificationsDetailsExtractor ┘
+                    └─ FlightDataExtractor (fallback: greps embedded RSC payload)
+                            ↓
+                      ExtractionEngine
+                      (per-field extractor chains + fallback)
+                            ↓
+                      Validation + confidence scoring + schema drift detection
+                            ↓
+                        ProfileData (+ optional metadata / diff / metrics)
+```
+
+Each field has an **ordered chain** of extractors. The engine tries them in
+sequence and keeps the first *valid* result:
+
+```python
+FIELD_EXTRACTORS = {
+    "experience": [ExperienceDetailsExtractor(), FlightDataExtractor("experience")],
+    "education":  [EducationDetailsExtractor(),  FlightDataExtractor("education")],
+    "skills":     [SkillsDetailsExtractor(),     FlightDataExtractor("skills")],
+    ...
+}
+```
+
+If the primary `/details/*` page changes or fails, the engine automatically
+falls through to the next strategy instead of the whole API breaking. Every
+page is captured exactly once; extractors operate on the captured text/HTML, so
+fallbacks cost no extra network round-trips.
+
+Confidence is a function of source + completeness
+(`details_page` > `main_profile` > `flight_data`, penalised for missing
+dates/empty lists). Schema drift detection compares actual results against
+expected minimums (e.g. a company in the top card implies experience should be
+non-empty) and reports `degraded` + a warning when a section comes back empty
+despite being expected.
+
+### Reverse-engineering notes
 
 Modern LinkedIn profile pages are split into two data tiers:
 
@@ -146,5 +280,8 @@ Create a Blueprint from this repo in Render and set the two env vars.
 - **Anti-bot**: heavy scraping from one session/IP can trigger LinkedIn's bot
   detection (reCAPTCHA / authwall). The in-memory cache helps, but it does not
   fully prevent this.
+- **Snapshot volatility**: the snapshot store is in-memory and resets on server
+  restart (free hosting has no persistent disk), so `/profile/changes` only
+  works while the process stays up.
 - **Free-tier cold start**: on Render's free plan the service sleeps after ~15
   min of inactivity; first request may take ~30–60s.
