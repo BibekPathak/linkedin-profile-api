@@ -199,10 +199,12 @@ def parse_education(text: str) -> list[Education]:
     lines_ = truncate_at_sidebar(lines(text))
     items: list[Education] = []
     i, n = 0, len(lines_)
+    header_found = False
     while i < n:
         line = lines_[i]
         low = line.lower()
         if low == "education":
+            header_found = True
             i += 1
             continue
         if low in NOISE or low.startswith("·") or is_date_range(line) or re.match(r"^\d+$", line):
@@ -244,7 +246,7 @@ def parse_education(text: str) -> list[Education]:
             )
         )
         i = j
-    return items
+    return items if header_found else []
 
 
 def parse_certifications(text: str) -> list[Certification]:
