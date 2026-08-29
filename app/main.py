@@ -45,10 +45,22 @@ async def lifespan(app: FastAPI):
     app.state.playwright = pw
     app.state.browser = await pw.chromium.launch(
         headless=True,
+        # Memory-lean flags for constrained hosts (Render free tier = 512MB).
         args=[
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
+            "--single-process",
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-default-apps",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--metrics-recording-only",
+            "--js-flags=--max-old-space-size=256",
         ],
     )
     logger.info("Playwright browser launched")
