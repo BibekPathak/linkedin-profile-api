@@ -260,13 +260,29 @@ committed. The `auth.py` module isolates all cookie handling.
   (note: **no `--with-deps`** — Render's free tier can't `sudo`, and its Python
   runtime already ships the Chromium system libraries)
 - Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-- Env vars: `LINKEDIN_LI_AT` and optionally `LINKEDIN_JSESSIONID` (set in the
-  Render dashboard, not in the repo)
+- Env vars: `LINKEDIN_LI_AT` (required) and optionally `SCRAPE_MODE` (default
+  `http`; set to `playwright` for full JS-hydrated sections on a paid plan)
 - Health check: `/health`
 
 Create a Web Service from this repo in Render (or use the Blueprint) and set
-the two env vars. Render's default Python is 3.14; the repo's `.python-version`
+the env vars. Render's default Python is 3.14; the repo's `.python-version`
 pins 3.12 so all dependencies (incl. `greenlet`) resolve to prebuilt wheels.
+
+### Scrape modes
+
+| Mode | Data | Memory | Notes |
+|------|------|--------|-------|
+| `http` (default) | name, headline, location, connections, about\*, experience, education\*, profile images, URN | ~tens of MB | Fast (~5s). Sections that LinkedIn only renders via JavaScript (education\*, skills, certifications, languages) report `degraded` + a `requires_javascript` warning. Works on Render free tier. |
+| `playwright` | everything, incl. skills/certs/languages | high (Chromium) | Full data, but exceeds the 512MB free-tier budget on heavy pages. Use on a paid plan (`SCRAPE_MODE=playwright`). |
+
+\* Availability varies: `about` and `education` are server-rendered for some
+profiles and JS-hydrated for others, so HTTP mode may report them as missing.
+
+The adaptive engine is what makes this acceptable: each field has an ordered
+extractor chain, and when the primary strategy can't produce valid data (e.g.
+the raw HTML lacks a JS-hydrated section), it falls through to the next
+strategy and surfaces a clear `schema_health`/`warnings` signal instead of
+silently returning garbage.
 
 ---
 
@@ -289,3 +305,6 @@ pins 3.12 so all dependencies (incl. `greenlet`) resolve to prebuilt wheels.
   works while the process stays up.
 - **Free-tier cold start**: on Render's free plan the service sleeps after ~15
   min of inactivity; first request may take ~30–60s.
+- **Free-tier memory (512MB)**: the default HTTP mode fits comfortably. The
+  Playwright mode (full skills/certs/languages) can exceed the budget on heavy
+  profiles and OOM — use it on a paid plan.
