@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 
@@ -30,6 +31,8 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
 
+SCRAPE_MODE = os.getenv("SCRAPE_MODE", "http")  # "http" (default) or "playwright"
+
 cache = TTLCache(ttl_seconds=900, max_size=200)
 snapshots = SnapshotStore()
 
@@ -41,32 +44,37 @@ FIELD_ORDER = [
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    pw = await async_playwright().start()
-    app.state.playwright = pw
-    app.state.browser = await pw.chromium.launch(
-        headless=True,
-        # Memory-lean flags for constrained hosts (Render free tier = 512MB).
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--single-process",
-            "--disable-gpu",
-            "--disable-software-rasterizer",
-            "--disable-extensions",
-            "--disable-background-networking",
-            "--disable-sync",
-            "--disable-default-apps",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--metrics-recording-only",
-            "--js-flags=--max-old-space-size=256",
-        ],
-    )
-    logger.info("Playwright browser launched")
+    app.state.scrape_mode = SCRAPE_MODE
+    if SCRAPE_MODE == "playwright":
+        pw = await async_playwright().start()
+        app.state.playwright = pw
+        app.state.browser = await pw.chromium.launch(
+            headless=True,
+            # Memory-lean flags for constrained hosts (Render free tier = 512MB).
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--single-process",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-sync",
+                "--disable-default-apps",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--metrics-recording-only",
+                "--js-flags=--max-old-space-size=256",
+            ],
+        )
+        logger.info("Playwright browser launched (playwright mode)")
+    else:
+        logger.info("HTTP scrape mode (no browser) — SCRAPE_MODE=%s", SCRAPE_MODE)
     yield
-    await app.state.browser.close()
-    await pw.stop()
+    if SCRAPE_MODE == "playwright":
+        await app.state.browser.close()
+        await pw.stop()
 
 
 app = FastAPI(
