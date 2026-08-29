@@ -1,9 +1,11 @@
 """HTTP-only page capture (no browser).
 
-The /details/* section pages are fully server-rendered — the profile data is
-present in the raw HTML response. Fetching them with a plain HTTP client
-(`httpx`) + the `li_at` cookie produces the exact same text the engine parses,
-but uses a few MB of RAM instead of a full Chromium instance.
+LinkedIn's *mobile web* version (`p_mwlite_profile_view` — served when the
+request uses a mobile user-agent) server-renders the ENTIRE profile into the
+raw HTML: name, headline, location, connections, about, experience, education,
+skills, certifications and languages. Fetching it with a plain HTTP client
+(`httpx`) + the `li_at` cookie returns everything the engine parses, using a
+few MB of RAM instead of a full Chromium instance.
 
 This is the default on constrained hosts (Render free tier = 512MB) where
 Playwright + Chromium reliably OOMs.
@@ -31,10 +33,21 @@ SECTION_PATHS = {
     "languages": "details/languages/",
 }
 
-BASE_HEADERS = {
+DESKTOP_HEADERS = {
     "user-agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+    ),
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.9",
+    "cache-control": "no-cache",
+}
+
+# Mobile UA → LinkedIn serves the server-rendered p_mwlite_profile_view page.
+MOBILE_HEADERS = {
+    "user-agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148"
     ),
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "accept-language": "en-US,en;q=0.9",
@@ -97,56 +110,68 @@ def _is_auth_wall(text: str) -> bool:
     return "sign in to linkedin" in head or "authwall" in head
 
 
-async def capture_profile_http(li_at: str, url: str) -> ExtractionContext:
-    """Fetch main profile + all detail pages via plain HTTP."""
+async def capture_profile_http(li_at: str, url: str, mobile: bool = True) -> ExtractionContext:
+    """Fetch the profile via plain HTTP.
+
+    mobile=True (default): fetch the server-rendered mobile page, which contains
+    every section (about/experience/education/skills/certifications/languages)
+    in a single response. mobile=False: fetch the desktop main page + /details/*
+    pages (partial — JS-hydrated sections will be missing).
+    """
     vanity = parse_vanity(url)
+    headers = dict(MOBILE_HEADERS if mobile else DESKTOP_HEADERS)
     cookies = dict(BASE_COOKIES)
     cookies["li_at"] = li_at
 
-    client = httpx.AsyncClient(
-        headers=BASE_HEADERS,
-        cookies=cookies,
-        timeout=30.0,
-        follow_redirects=True,
-    )
     ctx = ExtractionContext(vanity=vanity, profile_url=url)
+    client = httpx.AsyncClient(headers=headers, cookies=cookies, timeout=30.0, follow_redirects=True)
     try:
-        async def fetch(target: str, section: Optional[str]) -> Optional[PageCapture]:
-            start = time.time()
-            try:
-                resp = await client.get(target)
-            except Exception as e:
-                logger.warning("http fetch failed for %s: %s", target, e)
-                return None
-            if resp.status_code != 200:
-                logger.warning("http %s for %s", resp.status_code, target)
-                return None
-            html = resp.text
-            text = _html_to_text(html)
-            if _is_auth_wall(text):
+        if mobile:
+            cap = await _fetch(client, url)
+            if cap is None:
+                raise ScrapeError("SCRAPE_FAILED", "Main profile page could not be fetched.")
+            if _is_auth_wall(cap.main_text):
                 raise ScrapeError("AUTH_FAILED", "LinkedIn session expired or was rejected. Refresh LINKEDIN_LI_AT.")
-            title = ""
-            m = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
-            if m:
-                title = m.group(1).strip()
-            return PageCapture(
-                url=str(resp.url),
-                main_text=text,
-                html=html,
-                title=title,
-                duration_ms=int((time.time() - start) * 1000),
-            )
+            ctx.main = cap
+            return ctx
 
-        main = await fetch(url, None)
+        # Desktop fallback: main page + /details/* pages.
+        main = await _fetch(client, url)
         if main is None:
             raise ScrapeError("SCRAPE_FAILED", "Main profile page could not be fetched.")
+        if _is_auth_wall(main.main_text):
+            raise ScrapeError("AUTH_FAILED", "LinkedIn session expired or was rejected. Refresh LINKEDIN_LI_AT.")
         ctx.main = main
-
         base = f"https://www.linkedin.com/in/{vanity}/"
         for section, path in SECTION_PATHS.items():
-            cap = await fetch(base + path, section)
+            cap = await _fetch(client, base + path)
             if cap is not None:
                 ctx.details[section] = cap
         return ctx
     finally:
         await client.aclose()
+
+
+async def _fetch(client: httpx.AsyncClient, target: str) -> Optional[PageCapture]:
+    start = time.time()
+    try:
+        resp = await client.get(target)
+    except Exception as e:
+        logger.warning("http fetch failed for %s: %s", target, e)
+        return None
+    if resp.status_code != 200:
+        logger.warning("http %s for %s", resp.status_code, target)
+        return None
+    html = resp.text
+    text = _html_to_text(html)
+    title = ""
+    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
+    if m:
+        title = m.group(1).strip()
+    return PageCapture(
+        url=str(resp.url),
+        main_text=text,
+        html=html,
+        title=title,
+        duration_ms=int((time.time() - start) * 1000),
+    )

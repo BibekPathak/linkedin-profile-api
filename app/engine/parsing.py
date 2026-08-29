@@ -335,3 +335,325 @@ def parse_pills(text: str, header: str) -> list[str]:
 
 def skills_from_pills(text: str) -> list[Skill]:
     return [Skill(name=n) for n in parse_pills(text, "skills")]
+
+
+# ---- mobile web (p_mwlite_profile_view) parsing ---------------------------
+# The mobile page server-renders the whole profile as flat text. Layout
+# (blank lines elided):
+#   About this profile
+#   <name>
+#   ...
+#   2nd / Premium member
+#   <headline>
+#   <school>  <company>
+#   <location>
+#   <N>+ connections
+#   About
+#   <about text...>
+#   Experience
+#   <title> <company> <Mon YYYY> - <Present> <dur> <loc> <desc...>
+#   Education
+#   <school> <degree> <field> <YYYY> - <YYYY> <desc...>
+#   Skills
+#   <skill>...
+#   Accomplishments
+#   <count> Certifications
+#   <cert name> <issuer> ...
+#   <count> Languages
+#   <language>...
+
+MOBILE_SECTION_HEADERS = {
+    "about": "About",
+    "experience": "Experience",
+    "education": "Education",
+    "skills": "Skills",
+    "certifications": "Certifications",
+    "languages": "Languages",
+    "accomplishments": "Accomplishments",
+    "volunteer": "Volunteer Experience",
+    "featured": "Featured",
+    "activity": "Activity",
+    "highlights": "Highlights",
+}
+
+_MONTH = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+_MOBILE_DATE = re.compile(rf"^{_MONTH}\s*\d{{4}}$|^\d{{4}}$")
+
+
+def _is_mobile_date(line: str) -> bool:
+    return bool(_MOBILE_DATE.match(line))
+
+
+def _strip_mobile_noise(line: str) -> bool:
+    low = line.lower()
+    return low in {"see more", "see less", "…more", "…less", "more", "less", "-"} or line.startswith("…")
+
+
+def parse_mobile_profile(text: str) -> dict:
+    """Parse the mobile profile page text into a structured dict.
+
+    Returns keys: name, headline, location, connections, about, experience,
+    education, skills, certifications, languages.
+    """
+    lines_ = [l.strip() for l in text.splitlines() if l.strip()]
+    result: dict = {
+        "name": None, "headline": None, "location": None, "connections": None,
+        "about": None, "experience": [], "education": [], "skills": [],
+        "certifications": [], "languages": [],
+    }
+
+    # top card: name after "About this profile" (other-view) or "Share Profile" (self-view)
+    for i, l in enumerate(lines_):
+        if l in ("About this profile", "Share Profile") and i + 1 < len(lines_):
+            result["name"] = lines_[i + 1]
+            break
+    for i, l in enumerate(lines_):
+        if re.match(r"^[\d,+]+\+? connections$", l):
+            result["connections"] = l.split()[0]
+            break
+    for l in lines_:
+        if looks_like_location(l) and " · " not in l:
+            # Prefer "City, Region, Country" (3 parts) over "School, Campus" (2).
+            parts = [p.strip() for p in l.split(",") if p.strip()]
+            if len(parts) >= 3:
+                result["location"] = l
+                break
+    if result["location"] is None:
+        for l in lines_:
+            if looks_like_location(l) and " · " not in l and "Institute" not in l and "University" not in l and "School" not in l:
+                result["location"] = l
+                break
+    # headline: the line right after the LAST top-card name occurrence
+    name_idx = [i for i, l in enumerate(lines_) if l == result["name"]]
+    if name_idx:
+        i = name_idx[-1]
+        for j in range(i + 1, min(i + 12, len(lines_))):
+            cand = lines_[j]
+            if cand in ("1st", "2nd", "3rd", "Premium member", "Member") or cand.startswith("·"):
+                continue
+            if re.match(r"^Joined \d{4}$", cand) or "contact information" in cand.lower():
+                continue
+            if looks_like_location(cand) or "connections" in cand:
+                break
+            result["headline"] = cand
+            break
+
+    def _slice_until(header: str, stop_headers: set[str]) -> list[str]:
+        """Lines after `header` until a stop header or the section's own end."""
+        start = None
+        for i, l in enumerate(lines_):
+            if l == header:
+                start = i + 1
+                break
+        if start is None:
+            return []
+        out: list[str] = []
+        for l in lines_[start:]:
+            if l in stop_headers:
+                break
+            out.append(l)
+        return out
+
+    SECTION_STOPS = set(MOBILE_SECTION_HEADERS.values())
+
+    _ADD_PROMPTS = {
+        "add experience", "add education", "add skills", "add volunteering",
+        "add accomplishments", "add certifications", "add languages", "add featured",
+        "add a link", "add media", "add a photo", "upload a document",
+        "add past positions to find new career opportunities or to re",
+        "add your degree and college, get 11x more profile views. con",
+        "add skills to showcase your strengths, get your profile noti",
+        "ask to be recommended", "recommendations", "publications", "patents",
+        "courses", "projects", "honors & awards", "test scores",
+        "have more experience?", "have more education?",
+        "edit", "open to job opportunities", "product engineer", "roles",
+        "see all details", "visible to", "only recruiters", "private to you",
+        "organizations", "certification", "accomplishments",
+        "content credentials", "source or history information is available for this media.",
+        "learn more", "add accomplishments",
+    }
+    _SELF_STOPS = {"Contact", "Other similar profiles", "Recommendations", "Accomplishments"}
+
+    # About
+    about_lines = _slice_until("About", SECTION_STOPS)
+    result["about"] = clean(" ".join(
+        l for l in about_lines if not _strip_mobile_noise(l) and l.lower() not in _ADD_PROMPTS
+    ))
+
+    # Experience
+    exp_lines = _slice_until("Experience", SECTION_STOPS)
+    exp_lines = [l for l in exp_lines if l.lower() not in _ADD_PROMPTS]
+    result["experience"] = _parse_mobile_experience(exp_lines)
+
+    # Education (stop at Volunteer Experience / Skills)
+    edu_lines = _slice_until("Education", {"Volunteer Experience", "Skills", "Accomplishments", "Recommendations"})
+    edu_lines = [
+        l for l in edu_lines
+        if l.lower() not in _ADD_PROMPTS
+        and l != "Add education"
+        and not l.lower().startswith("add your degree")
+        and not l.lower().startswith("add past positions")
+        and not l.lower().startswith("have more")
+    ]
+    result["education"] = _parse_mobile_education(edu_lines)
+
+    # Skills (skills are single lines; stop at Accomplishments / Recommendations / Contact)
+    skills_lines = _slice_until("Skills", _SELF_STOPS | {"Certifications", "Accomplishments"})
+    if "add skills" in {l.lower() for l in skills_lines}:
+        skills_lines = []
+    result["skills"] = [
+        Skill(name=l) for l in skills_lines
+        if not _strip_mobile_noise(l)
+        and l not in ("See more", "See less")
+        and l.lower() not in _ADD_PROMPTS
+        and not l.lower().startswith("add ")
+        and l.lower() != "skills"
+    ]
+
+    # Certifications
+    cert_lines = _slice_until("Certifications", _SELF_STOPS | {"Languages", "Accomplishments"})
+    result["certifications"] = _parse_mobile_certifications(cert_lines)
+
+    # Languages (languages are single words; stop at a numeric count / Courses / Contact)
+    lang_lines: list[str] = []
+    for l in _slice_until("Languages", _SELF_STOPS | {"Courses", "Contact"}):
+        if re.match(r"^\d+$", l) or l == "Courses" or l.lower() in _ADD_PROMPTS or l.lower().startswith("add "):
+            break
+        lang_lines.append(l)
+    result["languages"] = [
+        Language(name=l) for l in lang_lines
+        if not _strip_mobile_noise(l) and re.match(r"^[A-Za-z][A-Za-z\s'\-]{1,30}$", l)
+    ]
+
+    return result
+
+
+def _parse_mobile_experience(lines_: list[str]) -> list[Experience]:
+    # Each entry is delimited by "See less" (mobile collapses each card).
+    blocks: list[list[str]] = []
+    cur: list[str] = []
+    for l in lines_:
+        if l in ("See less", "…less"):
+            if cur:
+                blocks.append(cur)
+                cur = []
+            continue
+        cur.append(l)
+    if cur:
+        blocks.append(cur)
+
+    items: list[Experience] = []
+    for block in blocks:
+        b = [l for l in block if not _strip_mobile_noise(l) and l not in ("See more", "See less")]
+        if not b:
+            continue
+        title = b[0]
+        company = None
+        date_range = None
+        location = None
+        desc: list[str] = []
+        j = 1
+        if j < len(b) and not _is_mobile_date(b[j]):
+            company = b[j]
+            j += 1
+        # date span
+        if j < len(b) and _is_mobile_date(b[j]):
+            start_d = b[j]
+            j += 1
+            if j < len(b) and b[j] == "-":
+                j += 1
+            end_d = None
+            if j < len(b) and (_is_mobile_date(b[j]) or b[j] == "Present"):
+                end_d = b[j]
+                j += 1
+            duration = None
+            if j < len(b) and re.match(r"^\d+ (yrs?|mos?)( \d+ (yrs?|mos?))?$", b[j]):
+                duration = b[j]
+                j += 1
+            span = clean(" - ".join(x for x in (start_d, end_d) if x))
+            date_range = f"{span} · {duration}" if duration and span else (span or duration)
+        # location
+        if j < len(b) and looks_like_location(b[j]):
+            location = b[j]
+            j += 1
+        desc = b[j:]
+        items.append(Experience(
+            title=title, company=company, date_range=date_range,
+            location=location, description=clean(" ".join(desc)) if desc else None,
+        ))
+    return items
+
+
+_INSTITUTION_RE = re.compile(
+    r"(School|University|Institute|Academy|College|\bIIT\b|\bIIIT\b|\bNIT\b|Stoa)",
+    re.I,
+)
+
+
+def _parse_mobile_education(lines_: list[str]) -> list[Education]:
+    # Each education entry begins at a line that looks like an institution
+    # (or is the first line). Descriptions never contain such a line, so this
+    # is a reliable split point even when "See less" delimiters are absent.
+    blocks: list[list[str]] = []
+    cur: list[str] = []
+    for l in lines_:
+        if _strip_mobile_noise(l) or l in ("See more", "See less"):
+            continue
+        if _INSTITUTION_RE.search(l) and cur and any(_is_mobile_date(x) for x in cur):
+            blocks.append(cur)
+            cur = []
+        cur.append(l)
+    if cur:
+        blocks.append(cur)
+
+    items: list[Education] = []
+    for block in blocks:
+        b = [l for l in block if not _strip_mobile_noise(l)]
+        if not b:
+            continue
+        school = b[0]
+        degree_lines: list[str] = []
+        date_range = None
+        j = 1
+        while j < len(b):
+            lj = b[j]
+            if _is_mobile_date(lj):
+                start_d = lj
+                j += 1
+                if j < len(b) and b[j] == "-":
+                    j += 1
+                end_d = None
+                if j < len(b) and (_is_mobile_date(b[j]) or b[j] == "Present"):
+                    end_d = b[j]
+                    j += 1
+                date_range = clean(" - ".join(x for x in (start_d, end_d) if x))
+                break
+            degree_lines.append(lj)
+            j += 1
+        desc = b[j:]
+        items.append(Education(
+            school=school,
+            degree=clean(" | ".join(degree_lines)) if degree_lines else None,
+            date_range=date_range,
+            description=clean(" ".join(desc)) if desc else None,
+        ))
+    return items
+
+
+def _parse_mobile_certifications(lines_: list[str]) -> list[Certification]:
+    items: list[Certification] = []
+    i, n = 0, len(lines_)
+    while i < n:
+        l = lines_[i]
+        if _strip_mobile_noise(l) or l in ("See more", "See less") or re.match(r"^\d+$", l):
+            i += 1
+            continue
+        name = l
+        issuer = None
+        j = i + 1
+        if j < n and not _strip_mobile_noise(lines_[j]) and not re.match(r"^\d+$", lines_[j]):
+            issuer = lines_[j]
+            j += 1
+        items.append(Certification(name=name, issuer=issuer))
+        i = j
+    return items

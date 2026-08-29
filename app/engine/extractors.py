@@ -54,6 +54,27 @@ class BaseExtractor:
             confidence=0.0, valid=False, warning=reason,
         )
 
+    def _images(self, cap: PageCapture) -> list[str]:
+        imgs: list[str] = []
+        for m in re.finditer(r'https://media\.licdn\.com/dms/image/[^"\s\\]+', cap.html):
+            src = m.group(0)
+            if "profile-displayphoto" in src or "profile-displaybackgroundimage" in src:
+                if src not in imgs:
+                    imgs.append(src)
+        return imgs
+
+    def _urn(self, cap: PageCapture) -> Optional[str]:
+        m = TOPCARD_URN_RE.search(cap.html)
+        if not m:
+            m = URN_RE.search(cap.html)
+        if m:
+            raw = m.group(1) or m.group(2)
+            if raw:
+                return "urn:li:fsd_profile:" + raw
+        # NOTE: the mobile page only exposes the *viewer's* member id, which is
+        # not the profile's URN — return None rather than a wrong value.
+        return None
+
 
 class MainProfileExtractor(BaseExtractor):
     """Top card + About from the main profile page.
@@ -119,25 +140,6 @@ class MainProfileExtractor(BaseExtractor):
                 connections = ls[i - 1]
                 break
         return {"name": name or title_name, "headline": headline, "location": location, "connections": connections}
-
-    def _images(self, cap: PageCapture) -> list[str]:
-        imgs: list[str] = []
-        for m in re.finditer(r'https://media\.licdn\.com/dms/image/[^"\s\\]+', cap.html):
-            src = m.group(0)
-            if "profile-displayphoto" in src or "profile-displaybackgroundimage" in src:
-                if src not in imgs:
-                    imgs.append(src)
-        return imgs
-
-    def _urn(self, cap: PageCapture) -> Optional[str]:
-        m = TOPCARD_URN_RE.search(cap.html)
-        if not m:
-            m = URN_RE.search(cap.html)
-        if m:
-            raw = m.group(1) or m.group(2)
-            if raw:
-                return "urn:li:fsd_profile:" + raw
-        return None
 
     def extract(self, ctx: ExtractionContext) -> dict[str, ExtractionResult]:
         cap = ctx.main
@@ -256,3 +258,39 @@ class LanguagesDetailsExtractor(DetailsExtractor):
         if not has_real_content:
             return self._missing("languages", "requires_javascript_or_empty")
         return self._result("languages", items, self.source, 0.9, valid=True)
+
+
+class MobileProfileExtractor(BaseExtractor):
+    """Extracts every field from the mobile web (p_mwlite) server-rendered page.
+
+    The mobile page includes about, experience, education, skills,
+    certifications and languages in a single HTML response — no JavaScript
+    needed. This is the primary strategy for HTTP mode on constrained hosts.
+    """
+
+    source = FieldSource.MAIN_PROFILE
+
+    def extract(self, ctx: ExtractionContext) -> dict[str, ExtractionResult]:
+        from app.engine.parsing import parse_mobile_profile
+
+        cap = ctx.main
+        parsed = parse_mobile_profile(cap.main_text)
+
+        results: dict[str, ExtractionResult] = {}
+        results["name"] = self._result("name", parsed.get("name"), self.source, 0.98, valid=bool(parsed.get("name")))
+        results["headline"] = self._result("headline", parsed.get("headline"), self.source, 0.92, valid=bool(parsed.get("headline")))
+        results["location"] = self._result("location", parsed.get("location"), self.source, 0.9, valid=bool(parsed.get("location")))
+        results["connections"] = self._result("connections", parsed.get("connections"), self.source, 0.9, valid=bool(parsed.get("connections")))
+        results["about"] = self._result("about", parsed.get("about"), self.source, 0.9, valid=bool(parsed.get("about")))
+        results["experience"] = self._result("experience", parsed.get("experience") or [], self.source, 0.95, valid=True)
+        results["education"] = self._result("education", parsed.get("education") or [], self.source, 0.95, valid=True)
+        results["skills"] = self._result("skills", parsed.get("skills") or [], self.source, 0.9, valid=True)
+        results["certifications"] = self._result("certifications", parsed.get("certifications") or [], self.source, 0.9, valid=True)
+        results["languages"] = self._result("languages", parsed.get("languages") or [], self.source, 0.9, valid=True)
+
+        urn = self._urn(cap)
+        results["profile_urn"] = self._result("profile_urn", urn, self.source, 0.99, valid=bool(urn))
+
+        imgs = self._images(cap)
+        results["profile_images"] = self._result("profile_images", imgs, self.source, 0.9, valid=len(imgs) > 0)
+        return results

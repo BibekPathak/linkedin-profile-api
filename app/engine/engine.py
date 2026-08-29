@@ -25,6 +25,7 @@ from app.engine.extractors import (
     ExperienceDetailsExtractor,
     LanguagesDetailsExtractor,
     MainProfileExtractor,
+    MobileProfileExtractor,
     SkillsDetailsExtractor,
 )
 from app.engine.flight import FlightDataExtractor
@@ -66,6 +67,28 @@ class ExtractionEngine:
         provenance: dict[str, FieldProvenance] = {}
         diagnostics = Diagnostics()
         diagnostics.pages_visited = 1 + len(ctx.details)
+
+        is_mobile = "About this profile" in ctx.main.main_text or "p_mwlite" in ctx.main.html[:4000]
+
+        if is_mobile:
+            # Mobile web page: one server-rendered response has every field.
+            mobile_extractor = MobileProfileExtractor()
+            mob = mobile_extractor.extract(ctx)
+            for field in SCALAR_FIELDS + list(FIELD_EXTRACTORS.keys()):
+                res = mob.get(field)
+                if res is None:
+                    res = ExtractionResult(field=field, value=None, source=FieldSource.MISSING, valid=False, warning="not_found")
+                else:
+                    res.confidence = score_confidence(field, res.value, res.source)
+                    if field in ("profile_images",):
+                        res.valid = len(res.value) > 0
+                    elif field in ("experience", "education", "skills", "certifications", "languages"):
+                        res.valid = True  # empty list is a valid "none present"
+                provenance[field] = FieldProvenance(field=field, result=res)
+            for field in FIELD_EXTRACTORS:
+                diagnostics.schema_health[field] = "healthy"
+            profile = self._build_profile(ctx, provenance)
+            return ExtractionOutcome(profile=profile, provenance=provenance, diagnostics=diagnostics)
 
         # scalar fields from main profile
         main_extractor = MainProfileExtractor()
