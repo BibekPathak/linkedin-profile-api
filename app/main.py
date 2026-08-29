@@ -41,6 +41,13 @@ FIELD_ORDER = [
     "profile_images", "experience", "education", "skills", "certifications", "languages",
 ]
 
+# Fields that count toward the scrape "success" metric. profile_urn is excluded
+# because the mobile-web (default HTTP) page doesn't expose it.
+METRIC_FIELDS = [
+    "name", "headline", "location", "about", "profile_images",
+    "experience", "education", "skills", "certifications", "languages",
+]
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -205,7 +212,7 @@ async def get_profile(
     # metrics
     field_status = {
         f: (outcome.provenance[f].result.valid if f in outcome.provenance else False)
-        for f in FIELD_ORDER
+        for f in METRIC_FIELDS
     }
     metrics.record_scrape(_classify(field_status), outcome.diagnostics.timings_ms.get("total", 0), field_status)
 
