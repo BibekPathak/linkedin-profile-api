@@ -256,13 +256,17 @@ committed. The `auth.py` module isolates all cookie handling.
 
 `render.yaml` is included:
 
-- Build: `pip install -r requirements.txt && python -m playwright install --with-deps chromium`
+- Build: `pip install -r requirements.txt && python -m playwright install chromium`
+  (note: **no `--with-deps`** — Render's free tier can't `sudo`, and its Python
+  runtime already ships the Chromium system libraries)
 - Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 - Env vars: `LINKEDIN_LI_AT` and optionally `LINKEDIN_JSESSIONID` (set in the
   Render dashboard, not in the repo)
 - Health check: `/health`
 
-Create a Blueprint from this repo in Render and set the two env vars.
+Create a Web Service from this repo in Render (or use the Blueprint) and set
+the two env vars. Render's default Python is 3.14; the repo's `.python-version`
+pins 3.12 so all dependencies (incl. `greenlet`) resolve to prebuilt wheels.
 
 ---
 
