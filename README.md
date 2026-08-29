@@ -272,17 +272,16 @@ pins 3.12 so all dependencies (incl. `greenlet`) resolve to prebuilt wheels.
 
 | Mode | Data | Memory | Notes |
 |------|------|--------|-------|
-| `http` (default) | name, headline, location, connections, about\*, experience, education\*, profile images, URN | ~tens of MB | Fast (~5s). Sections that LinkedIn only renders via JavaScript (education\*, skills, certifications, languages) report `degraded` + a `requires_javascript` warning. Works on Render free tier. |
-| `playwright` | everything, incl. skills/certs/languages | high (Chromium) | Full data, but exceeds the 512MB free-tier budget on heavy pages. Use on a paid plan (`SCRAPE_MODE=playwright`). |
+| `http` (default) | **everything**: name, headline, location, connections, about, experience, education, skills, certifications, languages, profile images | ~tens of MB | Fast (~1.5s). Fetches LinkedIn's **mobile web** page (`p_mwlite_profile_view`, served when the request uses a mobile user-agent), which server-renders the entire profile into the raw HTML — no browser or JavaScript needed. Works on Render free tier. |
+| `playwright` | everything | high (Chromium) | Same fields, rendered by a real browser. Use only if the mobile page ever changes; exceeds the 512MB free-tier budget on heavy pages. |
 
-\* Availability varies: `about` and `education` are server-rendered for some
-profiles and JS-hydrated for others, so HTTP mode may report them as missing.
-
-The adaptive engine is what makes this acceptable: each field has an ordered
-extractor chain, and when the primary strategy can't produce valid data (e.g.
-the raw HTML lacks a JS-hydrated section), it falls through to the next
-strategy and surfaces a clear `schema_health`/`warnings` signal instead of
-silently returning garbage.
+Why this matters: the **desktop** web app JS-hydrates about/education/skills/
+certifications/languages, so those sections are absent from the raw desktop
+HTML. The mobile web variant server-renders all of them. The adaptive engine
+keeps both paths working: it detects which layout it got, runs the matching
+extractor, and falls through the chain with clear `schema_health`/`warnings`
+if a section is missing or empty (e.g. a profile that genuinely has no
+languages returns an empty list, not garbage).
 
 ---
 
@@ -305,6 +304,6 @@ silently returning garbage.
   works while the process stays up.
 - **Free-tier cold start**: on Render's free plan the service sleeps after ~15
   min of inactivity; first request may take ~30–60s.
-- **Free-tier memory (512MB)**: the default HTTP mode fits comfortably. The
-  Playwright mode (full skills/certs/languages) can exceed the budget on heavy
-  profiles and OOM — use it on a paid plan.
+- **Profile URN**: the mobile web page doesn't expose the profile's URN (only
+  the logged-in viewer's member id), so `profile_urn` is `null` in HTTP mode.
+  The `playwright` mode provides it.
