@@ -251,9 +251,11 @@ def parse_certifications(text: str) -> list[Certification]:
     lines_ = truncate_at_sidebar(lines(text))
     items: list[Certification] = []
     i, n = 0, len(lines_)
+    header_found = False
     while i < n:
         low = lines_[i].lower()
         if low in ("licenses & certifications", "certifications"):
+            header_found = True
             i += 1
             continue
         if low in NOISE or low.startswith("·") or low in EMPTY_STATE:
@@ -278,16 +280,18 @@ def parse_certifications(text: str) -> list[Certification]:
             j += 1
         items.append(Certification(name=name, issuer=issuer, date_range=date_range))
         i = j
-    return items
+    return items if header_found else []
 
 
 def parse_languages(text: str) -> list[Language]:
     lines_ = truncate_at_sidebar(lines(text))
     items: list[Language] = []
     i, n = 0, len(lines_)
+    header_found = False
     while i < n:
         low = lines_[i].lower()
         if low == "languages":
+            header_found = True
             i += 1
             continue
         if low in NOISE or low.startswith("·") or low in EMPTY_STATE:
@@ -301,7 +305,7 @@ def parse_languages(text: str) -> list[Language]:
             j += 1
         items.append(Language(name=name, proficiency=proficiency))
         i = j
-    return items
+    return items if header_found else []
 
 
 def parse_pills(text: str, header: str) -> list[str]:
@@ -314,6 +318,9 @@ def parse_pills(text: str, header: str) -> list[str]:
             if low == header.lower():
                 found = True
             continue
+        # Ad / modal content signals the real section never rendered (JS-only).
+        if low.startswith("ad options") or low.startswith("why am i seeing") or "manage your ad" in low:
+            break
         if low in NOISE or re.match(r"^\d+\s*(endorsement|endorsements)$", low) or low.startswith("endorsed by"):
             continue
         if re.match(r"^\d+$", line):
@@ -321,7 +328,7 @@ def parse_pills(text: str, header: str) -> list[str]:
         if low in EMPTY_STATE:
             continue
         out.append(line)
-    return out
+    return out if found else []
 
 
 def skills_from_pills(text: str) -> list[Skill]:

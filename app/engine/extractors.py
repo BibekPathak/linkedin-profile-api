@@ -68,31 +68,57 @@ class MainProfileExtractor(BaseExtractor):
     def _top_card(self, cap: PageCapture) -> dict:
         """Parse the top-card block from main page text.
 
+        Handles two layouts:
+        - Playwright `main.innerText`: starts with name.
+        - Raw-HTML text extraction (HTTP mode): may start with the page title
+          ("<Name> | LinkedIn") and nav noise before the real top card.
+
         Layout (blank lines elided):
-            0: name
-            1: "· 2nd"  (connection degree / self marker)
-            2: headline
-            3: location
-            4: "·"  "Contact info" ...  "connections"
+            name
+            "· 1st" / "· 2nd"  (connection degree / self marker)
+            headline
+            location
+            "·"  "Contact info" ...  "connections"
         """
         ls = lines(cap.main_text)
         name = headline = location = connections = None
-        if ls:
-            name = ls[0]
-            for i, l in enumerate(ls):
-                if LOCATION_RE.search(l) and "connection" not in l.lower():
-                    location = l
-                    prev = ls[i - 1] if i >= 1 else None
-                    if prev and not re.match(r"^·\s*\d", prev):
-                        headline = prev
-                    elif i >= 2:
-                        headline = ls[i - 2]
-                    break
-            for i, l in enumerate(ls):
-                if l.lower() == "connections" and i >= 1:
-                    connections = ls[i - 1]
-                    break
-        return {"name": name, "headline": headline, "location": location, "connections": connections}
+
+        # Name: prefer the page <title> (strip " | LinkedIn").
+        m = re.search(r"^(.*?)\s*\|\s*LinkedIn$", cap.title.strip()) if cap.title else None
+        title_name = m.group(1).strip() if m else None
+
+        # Find the first line that looks like a real name (not nav/title noise).
+        idx = 0
+        for i, l in enumerate(ls):
+            if title_name and l == title_name:
+                idx = i
+                break
+            if (l and len(l) <= 40 and not l.startswith("·")
+                    and l.lower() not in {"0 notifications", "home", "my network", "jobs", "messaging", "notifications", "me", "learning", "for business", "more", "search", "skip to search"}
+                    and "linkedin" not in l.lower()):
+                idx = i
+                break
+        if ls and idx < len(ls):
+            name = ls[idx]
+
+        # location: line matching "<City>, <Region>[, <Country>]" but NOT the
+        # top-card "Company · School" summary line.
+        for i, l in enumerate(ls):
+            if LOCATION_RE.search(l) and "connection" not in l.lower():
+                if " · " in l:
+                    continue  # skip "Sorin Investments · IIIT Roorkee" style line
+                location = l
+                prev = ls[i - 1] if i >= 1 else None
+                if prev and not re.match(r"^·\s*\d", prev) and "contact info" not in prev.lower() and " · " not in prev:
+                    headline = prev
+                elif i >= 2:
+                    headline = ls[i - 2]
+                break
+        for i, l in enumerate(ls):
+            if l.lower() == "connections" and i >= 1:
+                connections = ls[i - 1]
+                break
+        return {"name": name or title_name, "headline": headline, "location": location, "connections": connections}
 
     def _images(self, cap: PageCapture) -> list[str]:
         imgs: list[str] = []
@@ -183,13 +209,17 @@ class SkillsDetailsExtractor(DetailsExtractor):
 
     def extract(self, ctx: ExtractionContext) -> ExtractionResult:
         cap = self._capture(ctx)
+        text_low = cap.main_text.lower()
         names = parse_pills(cap.main_text, "skills")
-        # Empty state is a legitimate, complete answer ("no skills yet").
-        # Only mark invalid if the page failed to load at all.
+        # Genuine empty-state marker (profile has no skills yet) -> valid empty.
+        if "add skills" in text_low or "showcase your skills" in text_low or "when you add new skills" in text_low:
+            return self._result("skills", [], self.source, 0.7, valid=True)
+        # Real content must have endorsement markers; otherwise the page is
+        # JS-hydrated-only (raw HTML via HTTP mode) -> missing.
+        has_real_content = "endorsed by" in text_low or "endorsement" in text_low or any(len(n) >= 3 for n in names)
+        if not has_real_content:
+            return self._missing("skills", "requires_javascript_or_empty")
         if not names:
-            text = cap.main_text.lower()
-            if "skills" not in text and "add skills" not in text:
-                return self._missing("skills", "section_not_found")
             return self._result("skills", [], self.source, 0.7, valid=True)
         return self._result("skills", skills_from_pills(cap.main_text), self.source, 0.9, valid=True)
 
@@ -200,12 +230,13 @@ class CertificationsDetailsExtractor(DetailsExtractor):
 
     def extract(self, ctx: ExtractionContext) -> ExtractionResult:
         cap = self._capture(ctx)
+        text_low = cap.main_text.lower()
         items = parse_certifications(cap.main_text)
-        if not items:
-            text = cap.main_text.lower()
-            if "certification" not in text:
-                return self._missing("certifications", "section_not_found")
+        if "nothing to see for now" in text_low or "add licenses or certifications" in text_low:
             return self._result("certifications", [], self.source, 0.7, valid=True)
+        has_real_content = any(i.name for i in items) and ("issued " in text_low or "show credential" in text_low)
+        if not has_real_content:
+            return self._missing("certifications", "requires_javascript_or_empty")
         return self._result("certifications", items, self.source, 0.9, valid=True)
 
 
@@ -215,10 +246,13 @@ class LanguagesDetailsExtractor(DetailsExtractor):
 
     def extract(self, ctx: ExtractionContext) -> ExtractionResult:
         cap = self._capture(ctx)
+        text_low = cap.main_text.lower()
         items = parse_languages(cap.main_text)
-        if not items:
-            text = cap.main_text.lower()
-            if "languages" not in text:
-                return self._missing("languages", "section_not_found")
+        if "nothing to see for now" in text_low or "add languages" in text_low:
             return self._result("languages", [], self.source, 0.7, valid=True)
+        has_real_content = any(i.name for i in items) and any(
+            i.proficiency for i in items if i.proficiency
+        )
+        if not has_real_content:
+            return self._missing("languages", "requires_javascript_or_empty")
         return self._result("languages", items, self.source, 0.9, valid=True)
