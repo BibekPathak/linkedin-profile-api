@@ -96,7 +96,10 @@ def _browser_or_none(app):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}@app.get("/")
+    return {"status": "ok"}
+
+
+@app.get("/")
 async def root():
     return {
         "service": "LinkedIn Profile API",
