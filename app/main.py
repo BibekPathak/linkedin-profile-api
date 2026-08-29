@@ -89,12 +89,14 @@ app = FastAPI(
 )
 
 
+def _browser_or_none(app):
+    """Return the shared browser only in Playwright mode (HTTP mode has none)."""
+    return getattr(app.state, "browser", None)
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
-
-
-@app.get("/")
+    return {"status": "ok"}@app.get("/")
 async def root():
     return {
         "service": "LinkedIn Profile API",
@@ -184,8 +186,7 @@ async def get_profile(
 
     metrics.record_cache(hit=False)
     try:
-        browser = app.state.browser
-        outcome = await scrape_profile(browser, url, include_metadata=True)
+        outcome = await scrape_profile(_browser_or_none(app), url, include_metadata=True)
     except ScrapeError as e:
         metrics.record_scrape("failed", 0)
         mapping = {"INVALID_URL": 400, "NOT_FOUND": 404, "AUTH_FAILED": 503, "SCRAPE_FAILED": 502}
@@ -225,9 +226,8 @@ async def profile_diff(req: DiffRequest):
     except ScrapeError as e:
         raise HTTPException(status_code=400, detail=e.detail)
 
-    browser = app.state.browser
     try:
-        outcome = await scrape_profile(browser, url, include_metadata=True)
+        outcome = await scrape_profile(_browser_or_none(app), url, include_metadata=True)
     except ScrapeError as e:
         mapping = {"AUTH_FAILED": 503, "NOT_FOUND": 404}
         raise HTTPException(status_code=mapping.get(e.code, 502), detail=e.detail)
@@ -245,9 +245,8 @@ async def save_snapshot(payload: ProfileUrlInput):
     except ScrapeError as e:
         raise HTTPException(status_code=400, detail=e.detail)
 
-    browser = app.state.browser
     try:
-        outcome = await scrape_profile(browser, url, include_metadata=True)
+        outcome = await scrape_profile(_browser_or_none(app), url, include_metadata=True)
     except ScrapeError as e:
         raise HTTPException(status_code=503 if e.code == "AUTH_FAILED" else 502, detail=e.detail)
 
@@ -267,9 +266,8 @@ async def get_changes(url: str = Query(..., description="LinkedIn profile URL"))
     if previous is None:
         return ChangesResponse(url=url, vanity_name=vanity, has_previous=False, changes={})
 
-    browser = app.state.browser
     try:
-        outcome = await scrape_profile(browser, url, include_metadata=True)
+        outcome = await scrape_profile(_browser_or_none(app), url, include_metadata=True)
     except ScrapeError as e:
         raise HTTPException(status_code=503 if e.code == "AUTH_FAILED" else 502, detail=e.detail)
 
